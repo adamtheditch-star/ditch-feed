@@ -1,15 +1,21 @@
-// /api/feed.js — embeddable people/things, no captions, resilient (never returns empty unless API/key fails)
+// /api/feed.js — people/things, embeddable, no-captions; debug + caching
 export default async function handler(req, res) {
-  // CORS for Carrd
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
-  const apiKey = process.env.YT_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'Missing YT_API_KEY' });
+  // Cache at Vercel edge for 2 minutes (dramatically reduces quota use)
+  res.setHeader('Cache-Control', 'public, s-maxage=120, stale-while-revalidate=600');
 
-  // Seeds biased to phone/normal footage
+  const debug = req.query.debug === '1';
+  const apiKey = process.env.YT_API_KEY;
+  if (!apiKey) {
+    const msg = { error: 'Missing YT_API_KEY' };
+    return debug ? res.status(500).json(msg) : res.json([]);
+  }
+
   const seeds = [
     'walking vlog today',
     'iphone vertical vlog',
@@ -22,79 +28,47 @@ export default async function handler(req, res) {
     'backyard cooking vlog',
     'dashcam evening drive'
   ];
-  const qParam = (req.query.q || seeds[Math.floor(Math.random()*seeds.length)]).toString();
+  const q = (req.query.q || seeds[Math.floor(Math.random()*seeds.length)]).toString();
+  const publishedAfter = new Date(Date.now() - 48*3600*1000).toISOString();
 
-  // Helper utils
-  const qs = (obj) => new URLSearchParams(obj).toString();
-  const fetchJSON = async (url) => {
-    const r = await fetch(url, { cache: 'no-store' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  };
-  const isoToSeconds = (iso='') => {
-    const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-    if (!m) return 0;
-    const h = parseInt(m[1]||'0',10), min = parseInt(m[2]||'0',10), s = parseInt(m[3]||'0',10);
-    return h*3600 + min*60 + s;
-  };
+  const qs = (o) => new URLSearchParams(o).toString();
 
-  // Brandy/“promo” heuristics
-  const BRANDY = /(official|vevo|records|label|tv|news|trailer|promo|advert|ads?|sponsored|brand(ed)?|music\s+video|lyric\s+video|teaser|episode|\bep\b|\bMV\b)/i;
+  // ---- 1) ONE search call (keeps quota low) ----
+  const searchURL = new URL('https://www.googleapis.com/youtube/v3/search');
+  searchURL.search = qs({
+    key: apiKey,
+    part: 'snippet',
+    type: 'video',
+    order: 'date',
+    maxResults: '50',
+    q,
+    publishedAfter,
+    videoEmbeddable: 'true',
+    videoSyndicated: 'true',
+    videoCaption: 'none',     // no captions
+    safeSearch: 'none'
+  });
 
-  // “People & things” categories preferred
-  const PREFERRED_CATS = new Set(['22','19','15','2','26','28']); // People&Blogs, Travel&Events, Pets, Autos, Howto&Style, Sci&Tech
-  const EXCLUDE_CATS   = new Set(['10','24','1','20','25','29','17','23']); // Music, Entertainment, Film&Animation, Gaming, News, Nonprofits, Sports, Comedy
-
-  // Try 2 passes: 1) strict recent window, 2) wider window if too few
-  const windows = [48, 7*24]; // hours
-  let candidateIds = new Set();
-
-  for (const hours of windows) {
-    const publishedAfter = new Date(Date.now() - hours*3600*1000).toISOString();
-    const seedA = qParam;
-    const seedB = seeds[Math.floor(Math.random()*seeds.length)];
-    const seedC = seeds[Math.floor(Math.random()*seeds.length)];
-
-    const buildSearch = (q) => {
-      const u = new URL('https://www.googleapis.com/youtube/v3/search');
-      u.search = qs({
-        key: apiKey,
-        part: 'snippet',
-        type: 'video',
-        order: 'date',
-        maxResults: '50',
-        q,
-        publishedAfter,
-        videoEmbeddable: 'true',
-        videoSyndicated: 'true',   // can be played outside youtube.com
-        videoCaption: 'none',      // <-- NO CAPTIONS
-        safeSearch: 'none',
-      });
-      return u.toString();
-    };
-
-    try {
-      const results = await Promise.allSettled(
-        [seedA, seedB, seedC].map(s => fetchJSON(buildSearch(s)))
-      );
-      for (const r of results) {
-        if (r.status !== 'fulfilled') continue;
-        const items = r.value.items || [];
-        for (const it of items) {
-          if (it?.snippet?.liveBroadcastContent !== 'none') continue; // no live
-          const id = it?.id?.videoId;
-          if (id) candidateIds.add(id);
-        }
-      }
-    } catch {}
-
-    if (candidateIds.size >= 10) break; // good enough
+  let searchJson, searchStatus = 200;
+  try {
+    const sr = await fetch(searchURL, { cache: 'no-store' });
+    searchStatus = sr.status;
+    searchJson = await sr.json();
+    if (!sr.ok) throw new Error(JSON.stringify(searchJson));
+  } catch (e) {
+    if (debug) return res.status(searchStatus || 500).json({ step:'search', status: searchStatus, error: String(e), body: searchJson });
+    return res.json([]);
   }
 
-  const ids = Array.from(candidateIds).slice(0, 50);
-  if (!ids.length) return res.json([]); // key/quota/region might be the issue
+  const ids = (searchJson.items || [])
+    .filter(it => it?.snippet?.liveBroadcastContent === 'none')
+    .map(it => it?.id?.videoId)
+    .filter(Boolean)
+    .slice(0, 50);
 
-  // Get details to filter
+  if (!ids.length) return debug ? res.json({ step:'search', status: searchStatus, items: 0 }) : res.json([]);
+
+  // ---- 2) Details filter (cheap) ----
   const detailsURL = new URL('https://www.googleapis.com/youtube/v3/videos');
   detailsURL.search = qs({
     key: apiKey,
@@ -103,77 +77,97 @@ export default async function handler(req, res) {
     maxResults: '50'
   });
 
-  let items = [];
+  let detailsJson, detailsStatus = 200;
   try {
-    const dj = await fetchJSON(detailsURL.toString());
-    items = dj.items || [];
-  } catch {
-    return res.json([]); // API trouble
+    const dr = await fetch(detailsURL, { cache: 'no-store' });
+    detailsStatus = dr.status;
+    detailsJson = await dr.json();
+    if (!dr.ok) throw new Error(JSON.stringify(detailsJson));
+  } catch (e) {
+    if (debug) return res.status(detailsStatus || 500).json({ step:'details', status: detailsStatus, error: String(e), body: detailsJson });
+    return res.json([]);
   }
 
-  // First pass: strict
-  let strict = [];
-  for (const v of items) {
-    const okEmbed = v?.status?.embeddable && v?.status?.uploadStatus === 'processed';
-    if (!okEmbed) continue;
+  const BRANDY = /(official|vevo|records|label|tv|news|trailer|promo|advert|ads?|sponsored|brand(ed)?|music\s+video|lyric\s+video|teaser|episode|\bep\b|\bMV\b)/i;
+  const PREFERRED_CATS = new Set(['22','19','15','2','26','28']);
+  const EXCLUDE_CATS   = new Set(['10','24','1','20','25','29','17','23']);
 
-    // Still ensure NO captions (defensive check; search already asked for none)
-    if (String(v?.contentDetails?.caption || '').toLowerCase() === 'true') continue;
+  const isoToSeconds = (iso='') => {
+    const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+    if (!m) return 0;
+    const h = parseInt(m[1]||'0',10), min = parseInt(m[2]||'0',10), s = parseInt(m[3]||'0',10);
+    return h*3600 + min*60 + s;
+  };
+
+  const items = detailsJson.items || [];
+
+  // strict pass
+  let out = items.filter(v => {
+    const okEmbed = v?.status?.embeddable && v?.status?.uploadStatus === 'processed';
+    if (!okEmbed) return false;
+
+    // captions must be false
+    if (String(v?.contentDetails?.caption || '').toLowerCase() === 'true') return false;
 
     const durS = isoToSeconds(v?.contentDetails?.duration || '');
-    if (durS < 20 || durS > 1200) continue; // 20s–20min
+    if (durS < 20 || durS > 1200) return false;
 
     const views = parseInt(v?.statistics?.viewCount || '0', 10);
-    if (isFinite(views) && views >= 5000) continue; // low-ish views
+    if (isFinite(views) && views >= 5000) return false;
 
     const cat = String(v?.snippet?.categoryId || '');
+    if (!PREFERRED_CATS.has(cat)) return false;
+
     const title = v?.snippet?.title || '';
     const channel = v?.snippet?.channelTitle || '';
     const tags = (v?.snippet?.tags || []).join(' ').toLowerCase();
+    if (BRANDY.test(title) || BRANDY.test(channel)) return false;
+    if (/(official|promo|trailer|vevo|records|label|lyrics?)/.test(tags)) return false;
 
-    // Prefer people/things categories
-    if (!PREFERRED_CATS.has(cat)) continue;
+    return true;
+  }).map(v => v.id);
 
-    // Brandy heuristics
-    if (BRANDY.test(title) || BRANDY.test(channel)) continue;
-    if (/(official|promo|trailer|vevo|records|label|lyrics?)/.test(tags)) continue;
-
-    strict.push(v.id);
-  }
-
-  // If too few results, relax to: allow other categories except excluded, keep no-captions + embeddable + heuristics
-  let relaxed = strict;
-  if (relaxed.length < 10) {
-    relaxed = [];
-    for (const v of items) {
+  // relaxed if needed
+  if (out.length < 8) {
+    out = items.filter(v => {
       const okEmbed = v?.status?.embeddable && v?.status?.uploadStatus === 'processed';
-      if (!okEmbed) continue;
-      if (String(v?.contentDetails?.caption || '').toLowerCase() === 'true') continue;
+      if (!okEmbed) return false;
+      if (String(v?.contentDetails?.caption || '').toLowerCase() === 'true') return false;
 
       const durS = isoToSeconds(v?.contentDetails?.duration || '');
-      if (durS < 20 || durS > 1200) continue;
+      if (durS < 15 || durS > 1800) return false;
 
       const views = parseInt(v?.statistics?.viewCount || '0', 10);
-      if (isFinite(views) && views >= 5000) continue;
+      if (isFinite(views) && views >= 15000) return false;
 
       const cat = String(v?.snippet?.categoryId || '');
-      if (EXCLUDE_CATS.has(cat)) continue; // avoid music, entertainment, etc.
+      if (EXCLUDE_CATS.has(cat)) return false;
 
       const title = v?.snippet?.title || '';
       const channel = v?.snippet?.channelTitle || '';
       const tags = (v?.snippet?.tags || []).join(' ').toLowerCase();
-      if (BRANDY.test(title) || BRANDY.test(channel)) continue;
-      if (/(official|promo|trailer|vevo|records|label|lyrics?)/.test(tags)) continue;
+      if (BRANDY.test(title) || BRANDY.test(channel)) return false;
+      if (/(official|promo|trailer|vevo|records|label|lyrics?)/.test(tags)) return false;
 
-      relaxed.push(v.id);
-    }
+      return true;
+    }).map(v => v.id);
   }
 
-  // Shuffle + return (may still be empty if API/starvation)
-  const out = relaxed.length ? relaxed : strict;
+  // shuffle
   for (let i = out.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random()*(i+1));
     [out[i], out[j]] = [out[j], out[i]];
   }
+
+  if (debug) {
+    return res.json({
+      debug: true,
+      searchStatus, detailsStatus,
+      inSearch: ids.length, inDetails: items.length,
+      outCount: out.length,
+      sample: out.slice(0, 10)
+    });
+  }
+
   res.json(out.slice(0, 50));
 }
