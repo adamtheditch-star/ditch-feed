@@ -116,7 +116,7 @@ export default async function handler(req, res) {
 
       // Low-ish views
       const views = parseInt(v?.statistics?.viewCount || '0', 10);
-      if (isFinite(views) && views >= 100) continue;
+      if (isFinite(views) && views >= 1000) continue;
 
       // Category whitelist (people/things)
       const cat = v?.snippet?.categoryId;
